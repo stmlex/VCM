@@ -1,0 +1,107 @@
+stages:
+    - build
+    - release
+    - deploy
+
+include:
+  - project: 'ci_cd/tools'
+    ref: '1.2.1'
+    file: 
+        - '/zip.yaml'
+        - '/download_upload.yaml'
+  - project: 'ci_cd/release'
+    ref: '1.0.1'
+    file: /release.yaml
+
+        
+workflow:
+    rules:
+        - if: $CI_COMMIT_TAG
+
+generate_packages:
+    stage: build
+    script:
+        # Note: Script requires to run gitlab-runner in "shell" mode using "cmd" as the shell (not "powershell")
+        - start "" /wait "C:\Program Files\Altium\AD21\X2.EXE" -RScriptingSystem:RunScript(ProjectName="%cd%\%CI_PROJECT_NAME%.PrjPcb"^|ProcName="GenerateOutputFiles")
+        - rmdir /S /Q History
+    after_script:
+      - taskkill /im x2.exe 
+      # - taskkill /f /im x2.exe 
+    tags: ["altium", "windows"]
+    artifacts:
+        untracked: true
+        expire_in: 1 hrs
+
+changelog_job:
+  stage: release
+  extends: .auto-changelog
+  script:
+    - |
+      if $(git describe --abbrev=0 --tags HEAD~1); then
+        auto-changelog --starting-commit $(git rev-list $(git show-ref --hash $(git describe --abbrev=0 --tags HEAD~1))..HEAD | tail -1) --tag-pattern "(.\d*)" --stdout >> RELEASENOTES.md
+      else
+        auto-changelog --tag-pattern "(.\d*)" --stdout >> RELEASENOTES.md
+      fi
+
+release_job:
+  stage: release
+  extends: .release
+  needs:
+    - job: generate_packages
+      artifacts: false
+    - job: changelog_job
+      artifacts: true
+  release:
+    name: 'Release $CI_COMMIT_TAG'
+    tag_name: '$CI_COMMIT_TAG'
+    ref: '$CI_COMMIT_TAG'
+    description: './RELEASENOTES.md'
+
+process_artifacts:
+    stage: deploy
+    image: mcr.microsoft.com/powershell:7.2-alpine-3.13
+    needs:
+        - job: generate_packages
+          artifacts: true
+    script:
+        - pwsh -command "& { . .\deploy.ps1; Manufacturing }"
+        - pwsh -command "& { . .\deploy.ps1; Get-ArchiveName }"
+    artifacts:
+        expire_in: 1 hrs
+        untracked: true
+        reports:
+            dotenv: variables.env
+    tags: 
+        - docker
+
+zip_job:
+    stage: deploy
+    extends: .zip
+    needs:
+        - job: process_artifacts
+          artifacts: true
+    before_script:
+      - rm -f ./variables.env
+    variables:
+        GIT_STRATEGY: none
+        KS2_ARCHIVE_DIR: "./*"
+        KS2_ARCHIVE_FILE: "$ARCHIVE_NAME"
+
+upload_job:
+    stage: deploy
+    extends: .confpoint  
+    needs:
+        - job: zip_job
+          artifacts: true
+        - job: process_artifacts
+          artifacts: true
+    variables:
+        KS2_UPLOAD_FILE: $KS2_ARCHIVE_FILE
+        KS2_UPLOAD_DOMEN: '/sites/SPBTeam'
+        KS2_PREUPLOAD_PATH: "Shared Documents/Projects/$PROJECT_TITLE"
+        KS2_UPLOAD_PATH: "$KS2_PREUPLOAD_PATH/HW"
+    script:
+        - confpoint-uploader -u "$KS2_SHAREPOINT_USER" -p "$KS2_SHAREPOINT_PASS" -f "./README.md" -g "$KS2_UPLOAD_DOMEN" -r "$KS2_PREUPLOAD_PATH" -l "https://ks2corpinc.sharepoint.com"
+        - confpoint-uploader -u "$KS2_SHAREPOINT_USER" -p "$KS2_SHAREPOINT_PASS" -f "$KS2_UPLOAD_FILE" -g "$KS2_UPLOAD_DOMEN" -r "$KS2_UPLOAD_PATH" -l "https://ks2corpinc.sharepoint.com" --timeout "$KS2_SHAREPOINT_TIMEOUT"
+
+
